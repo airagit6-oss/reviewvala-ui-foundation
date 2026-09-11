@@ -82,10 +82,10 @@ type RatingSnapshot = {
 };
 
 const fallbackReviews: Review[] = [
-  { id: 1, initials: "AK", name: "Aarav Kapoor", source: "Google", location: "Indiranagar, Bengaluru", rating: 5, time: "18 min ago", status: "Needs reply", sentiment: "Positive", text: "The onboarding was effortless and the support team explained everything clearly. Priya was especially patient and helpful." },
-  { id: 2, initials: "SM", name: "Sofia Martinez", source: "Trustpilot", location: "SoHo, New York", rating: 3, time: "1 hr ago", status: "Assigned", sentiment: "Mixed", text: "Good product overall, but I waited longer than expected for an update on my request." },
-  { id: 3, initials: "JL", name: "James Liu", source: "Facebook", location: "Shoreditch, London", rating: 1, time: "3 hrs ago", status: "Escalated", sentiment: "Negative", text: "My issue is still unresolved after two conversations. I need someone to take ownership." },
-  { id: 4, initials: "NP", name: "Nina Patel", source: "Google", location: "Indiranagar, Bengaluru", rating: 5, time: "Yesterday", status: "Replied", sentiment: "Positive", text: "Fast, thoughtful and genuinely friendly service. Would recommend to any growing business." },
+  { id: "fallback-1", initials: "AK", name: "Aarav Kapoor", source: "Google", location: "Indiranagar, Bengaluru", rating: 5, time: "18 min ago", status: "Needs reply", sentiment: "Positive", text: "The onboarding was effortless and the support team explained everything clearly. Priya was especially patient and helpful." },
+  { id: "fallback-2", initials: "SM", name: "Sofia Martinez", source: "Trustpilot", location: "SoHo, New York", rating: 3, time: "1 hr ago", status: "Assigned", sentiment: "Mixed", text: "Good product overall, but I waited longer than expected for an update on my request." },
+  { id: "fallback-3", initials: "JL", name: "James Liu", source: "Facebook", location: "Shoreditch, London", rating: 1, time: "3 hrs ago", status: "Escalated", sentiment: "Negative", text: "My issue is still unresolved after two conversations. I need someone to take ownership." },
+  { id: "fallback-4", initials: "NP", name: "Nina Patel", source: "Google", location: "Indiranagar, Bengaluru", rating: 5, time: "Yesterday", status: "Replied", sentiment: "Positive", text: "Fast, thoughtful and genuinely friendly service. Would recommend to any growing business." },
 ];
 
 function mapReview(row: {
@@ -101,6 +101,56 @@ function mapReview(row: {
   review_text: string;
 }): Review {
   return { id: row.id, initials: row.reviewer_initials, name: row.reviewer_name, source: row.source, location: row.location, rating: row.rating, time: row.time_label, status: row.status, sentiment: row.sentiment, text: row.review_text };
+}
+
+function useWorkspaceData() {
+  const [workspaceReviews, setWorkspaceReviews] = useState<Review[]>(fallbackReviews);
+  const [responses, setResponses] = useState<ResponseRecord[]>([]);
+  const [snapshots, setSnapshots] = useState<RatingSnapshot[]>([]);
+  const [dataStatus, setDataStatus] = useState<"loading" | "ready" | "error">("loading");
+
+  const refresh = useCallback(async () => {
+    setDataStatus("loading");
+    const [reviewResult, responseResult, snapshotResult] = await Promise.all([
+      supabase.from("reviewvala_reviews").select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").eq("workspace_slug", "northstar-group").order("created_at", { ascending: false }),
+      supabase.from("reviewvala_responses").select("id, review_id, response_text, response_status, author_name").order("created_at", { ascending: false }),
+      supabase.from("reviewvala_rating_snapshots").select("id, channel, rating, period_label").eq("workspace_slug", "northstar-group").order("created_at", { ascending: true }),
+    ]);
+
+    const firstError = reviewResult.error ?? responseResult.error ?? snapshotResult.error;
+    if (firstError) {
+      console.error(firstError);
+      setDataStatus("error");
+      return;
+    }
+
+    setWorkspaceReviews((reviewResult.data ?? []).map(mapReview));
+    setResponses(responseResult.data ?? []);
+    setSnapshots(snapshotResult.data ?? []);
+    setDataStatus("ready");
+  }, []);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const saveResponse = useCallback(async (reviewId: string, responseText: string) => {
+    const existing = responses.find((response) => response.review_id === reviewId);
+    const responseResult = existing
+      ? await supabase.from("reviewvala_responses").update({ response_text: responseText, response_status: "Approved" }).eq("id", existing.id).select("id, review_id, response_text, response_status, author_name").single()
+      : await supabase.from("reviewvala_responses").insert({ review_id: reviewId, response_text: responseText, response_status: "Approved" }).select("id, review_id, response_text, response_status, author_name").single();
+    if (responseResult.error) throw responseResult.error;
+    const reviewResult = await supabase.from("reviewvala_reviews").update({ status: "Replied" }).eq("id", reviewId).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
+    if (reviewResult.error) throw reviewResult.error;
+    setResponses((current) => [responseResult.data, ...current.filter((response) => response.id !== responseResult.data.id)]);
+    setWorkspaceReviews((current) => current.map((review) => review.id === reviewId ? mapReview(reviewResult.data) : review));
+  }, [responses]);
+
+  const approveResponse = useCallback(async (responseId: string) => {
+    const result = await supabase.from("reviewvala_responses").update({ response_status: "Approved" }).eq("id", responseId).select("id, review_id, response_text, response_status, author_name").single();
+    if (result.error) throw result.error;
+    setResponses((current) => current.map((response) => response.id === responseId ? result.data : response));
+  }, []);
+
+  return { reviews: workspaceReviews, responses, snapshots, dataStatus, saveResponse, approveResponse };
 }
 
 const pageDescriptions: Record<PageKey, string> = {
