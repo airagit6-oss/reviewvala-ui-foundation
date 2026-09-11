@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -33,6 +33,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
 
 type PageKey = "Overview" | "Reviews" | "Response Center" | "Ratings" | "Analytics" | "Alerts" | "Locations" | "Team" | "Reports" | "Settings";
@@ -52,12 +53,55 @@ const navGroups: { label: string; items: { name: PageKey; icon: typeof Gauge; ba
   ]},
 ];
 
-const reviews = [
+type Review = {
+  id: string;
+  initials: string;
+  name: string;
+  source: string;
+  location: string;
+  rating: number;
+  time: string;
+  status: string;
+  sentiment: string;
+  text: string;
+};
+
+type ResponseRecord = {
+  id: string;
+  review_id: string;
+  response_text: string;
+  response_status: string;
+  author_name: string;
+};
+
+type RatingSnapshot = {
+  id: string;
+  channel: string;
+  rating: number;
+  period_label: string;
+};
+
+const fallbackReviews: Review[] = [
   { id: 1, initials: "AK", name: "Aarav Kapoor", source: "Google", location: "Indiranagar, Bengaluru", rating: 5, time: "18 min ago", status: "Needs reply", sentiment: "Positive", text: "The onboarding was effortless and the support team explained everything clearly. Priya was especially patient and helpful." },
   { id: 2, initials: "SM", name: "Sofia Martinez", source: "Trustpilot", location: "SoHo, New York", rating: 3, time: "1 hr ago", status: "Assigned", sentiment: "Mixed", text: "Good product overall, but I waited longer than expected for an update on my request." },
   { id: 3, initials: "JL", name: "James Liu", source: "Facebook", location: "Shoreditch, London", rating: 1, time: "3 hrs ago", status: "Escalated", sentiment: "Negative", text: "My issue is still unresolved after two conversations. I need someone to take ownership." },
   { id: 4, initials: "NP", name: "Nina Patel", source: "Google", location: "Indiranagar, Bengaluru", rating: 5, time: "Yesterday", status: "Replied", sentiment: "Positive", text: "Fast, thoughtful and genuinely friendly service. Would recommend to any growing business." },
 ];
+
+function mapReview(row: {
+  id: string;
+  reviewer_initials: string;
+  reviewer_name: string;
+  source: string;
+  location: string;
+  rating: number;
+  time_label: string;
+  status: string;
+  sentiment: string;
+  review_text: string;
+}): Review {
+  return { id: row.id, initials: row.reviewer_initials, name: row.reviewer_name, source: row.source, location: row.location, rating: row.rating, time: row.time_label, status: row.status, sentiment: row.sentiment, text: row.review_text };
+}
 
 const pageDescriptions: Record<PageKey, string> = {
   Overview: "Your reputation, response health, and priorities at a glance.",
