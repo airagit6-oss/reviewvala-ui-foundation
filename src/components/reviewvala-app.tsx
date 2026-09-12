@@ -135,13 +135,10 @@ function useWorkspaceData() {
   const saveResponse = useCallback(async (reviewId: string, responseText: string) => {
     const existing = responses.find((response) => response.review_id === reviewId);
     const responseResult = existing
-      ? await supabase.from("reviewvala_responses").update({ response_text: responseText, response_status: "Approved" }).eq("id", existing.id).select("id, review_id, response_text, response_status, author_name").single()
-      : await supabase.from("reviewvala_responses").insert({ review_id: reviewId, response_text: responseText, response_status: "Approved" }).select("id, review_id, response_text, response_status, author_name").single();
+      ? await supabase.from("reviewvala_responses").update({ response_text: responseText, response_status: "Draft" }).eq("id", existing.id).select("id, review_id, response_text, response_status, author_name").single()
+      : await supabase.from("reviewvala_responses").insert({ review_id: reviewId, response_text: responseText, response_status: "Draft" }).select("id, review_id, response_text, response_status, author_name").single();
     if (responseResult.error) throw responseResult.error;
-    const reviewResult = await supabase.from("reviewvala_reviews").update({ status: "Replied" }).eq("id", reviewId).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
-    if (reviewResult.error) throw reviewResult.error;
     setResponses((current) => [responseResult.data, ...current.filter((response) => response.id !== responseResult.data.id)]);
-    setWorkspaceReviews((current) => current.map((review) => review.id === reviewId ? mapReview(reviewResult.data) : review));
   }, [responses]);
 
   const approveResponse = useCallback(async (responseId: string) => {
@@ -150,7 +147,40 @@ function useWorkspaceData() {
     setResponses((current) => current.map((response) => response.id === responseId ? result.data : response));
   }, []);
 
-  return { reviews: workspaceReviews, responses, snapshots, dataStatus, saveResponse, approveResponse };
+  const publishResponse = useCallback(async (responseId: string) => {
+    const response = responses.find((item) => item.id === responseId);
+    if (!response || response.response_status !== "Approved") throw new Error("Only approved responses can be published.");
+    const responseResult = await supabase.from("reviewvala_responses").update({ response_status: "Published" }).eq("id", responseId).select("id, review_id, response_text, response_status, author_name").single();
+    if (responseResult.error) throw responseResult.error;
+    const reviewResult = await supabase.from("reviewvala_reviews").update({ status: "Replied" }).eq("id", response.review_id).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
+    if (reviewResult.error) throw reviewResult.error;
+    setResponses((current) => current.map((item) => item.id === responseId ? responseResult.data : item));
+    setWorkspaceReviews((current) => current.map((review) => review.id === response.review_id ? mapReview(reviewResult.data) : review));
+  }, [responses]);
+
+  const createReview = useCallback(async (input: { name: string; source: string; location: string; rating: number; text: string }) => {
+    const nameParts = input.name.trim().split(/\s+/).filter(Boolean);
+    const initials = nameParts.slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("") || "RV";
+    const sentiment = input.rating >= 4 ? "Positive" : input.rating === 3 ? "Mixed" : "Negative";
+    const result = await supabase.from("reviewvala_reviews").insert({
+      workspace_slug: "northstar-group",
+      reviewer_initials: initials,
+      reviewer_name: input.name.trim(),
+      source: input.source,
+      location: input.location.trim(),
+      rating: input.rating,
+      time_label: "Just now",
+      status: "Needs reply",
+      sentiment,
+      review_text: input.text.trim(),
+    }).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
+    if (result.error) throw result.error;
+    const review = mapReview(result.data);
+    setWorkspaceReviews((current) => [review, ...current]);
+    return review;
+  }, []);
+
+  return { reviews: workspaceReviews, responses, snapshots, dataStatus, saveResponse, approveResponse, publishResponse, createReview };
 }
 
 const pageDescriptions: Record<PageKey, string> = {
@@ -230,13 +260,28 @@ function RecentReviews({ setPage, reviews }: { setPage: (p: PageKey) => void; re
 
 function LocationsSnapshot() { const rows = [{name:"Indiranagar",score:"4.8",change:"+0.2",width:"92%"},{name:"SoHo",score:"4.6",change:"+0.1",width:"84%"},{name:"Shoreditch",score:"4.1",change:"−0.3",width:"68%"},{name:"Marina Bay",score:"4.7",change:"+0.2",width:"88%"}]; return <section className="rounded-lg border bg-card p-4 shadow-card"><div className="flex items-center justify-between"><div><h2 className="font-display text-base font-bold">Location health</h2><p className="mt-1 text-xs text-muted-foreground">Top and at-risk locations</p></div><MapPin className="size-4 text-brand"/></div><div className="mt-5 space-y-5">{rows.map((row) => <div key={row.name}><div className="mb-2 flex items-center justify-between text-xs"><span className="font-semibold">{row.name}</span><span><strong>{row.score}</strong> <span className={row.change.startsWith("+") ? "text-success" : "text-destructive"}>{row.change}</span></span></div><div className="h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-brand" style={{width: row.width}}/></div></div>)}</div></section>; }
 
-function ReviewsPage({ reviews, responses, saveResponse }: { reviews: Review[]; responses: ResponseRecord[]; saveResponse: (reviewId: string, responseText: string) => Promise<void> }) {
-  const [selected, setSelected] = useState<Review | null>(reviews[0] ?? null); const [reply, setReply] = useState(""); const [saving, setSaving] = useState(false); const [message, setMessage] = useState("");
+type CreateReviewInput = { name: string; source: string; location: string; rating: number; text: string };
+
+function ReviewForm({ close, createReview }: { close: () => void; createReview: (input: CreateReviewInput) => Promise<Review> }) {
+  const [form, setForm] = useState<CreateReviewInput>({ name: "", source: "Google", location: "", rating: 5, text: "" });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!form.name.trim() || !form.location.trim() || !form.text.trim()) { setError("Complete the customer, location, and review fields."); return; }
+    setSaving(true); setError("");
+    try { await createReview(form); close(); } catch (caught) { console.error(caught); setError("Could not create this review. Try again."); } finally { setSaving(false); }
+  };
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-overlay/60 p-4" onMouseDown={close}><form onSubmit={(event) => void submit(event)} onMouseDown={(event) => event.stopPropagation()} className="w-full max-w-lg rounded-lg border bg-background p-5 shadow-modal"><div className="flex items-start justify-between gap-4"><div><h2 className="font-display text-lg font-bold">Add a review</h2><p className="mt-1 text-xs text-muted-foreground">Capture a customer conversation in the shared inbox.</p></div><IconButton label="Close review form" onClick={close}><X/></IconButton></div><div className="mt-5 grid gap-4 sm:grid-cols-2"><label className="grid gap-1.5 text-xs font-semibold">Customer name<Input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Maya Chen" /></label><label className="grid gap-1.5 text-xs font-semibold">Source<select value={form.source} onChange={(event) => setForm({ ...form, source: event.target.value })} className="h-10 rounded-md border bg-background px-3 text-sm font-normal"><option>Google</option><option>Trustpilot</option><option>Facebook</option><option>Internal</option></select></label><label className="grid gap-1.5 text-xs font-semibold">Location<Input required value={form.location} onChange={(event) => setForm({ ...form, location: event.target.value })} placeholder="Indiranagar, Bengaluru" /></label><label className="grid gap-1.5 text-xs font-semibold">Rating<select value={form.rating} onChange={(event) => setForm({ ...form, rating: Number(event.target.value) })} className="h-10 rounded-md border bg-background px-3 text-sm font-normal"><option value="5">5 — Excellent</option><option value="4">4 — Good</option><option value="3">3 — Mixed</option><option value="2">2 — Poor</option><option value="1">1 — Critical</option></select></label></div><label className="mt-4 grid gap-1.5 text-xs font-semibold">Review text<textarea required value={form.text} onChange={(event) => setForm({ ...form, text: event.target.value })} placeholder="What did the customer share?" className="min-h-28 resize-none rounded-md border bg-background p-3 text-sm font-normal leading-6 outline-none focus:ring-2 focus:ring-ring" /></label>{error && <p className="mt-3 text-xs text-destructive">{error}</p>}<div className="mt-5 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={close}>Cancel</Button><Button type="submit" disabled={saving}>{saving ? "Creating…" : "Create review"}</Button></div></form></div>;
+}
+
+function ReviewsPage({ reviews, responses, saveResponse, createReview }: { reviews: Review[]; responses: ResponseRecord[]; saveResponse: (reviewId: string, responseText: string) => Promise<void>; createReview: (input: CreateReviewInput) => Promise<Review> }) {
+  const [selected, setSelected] = useState<Review | null>(reviews[0] ?? null); const [reply, setReply] = useState(""); const [saving, setSaving] = useState(false); const [message, setMessage] = useState(""); const [formOpen, setFormOpen] = useState(false);
   useEffect(() => { if (!selected && reviews[0]) setSelected(reviews[0]); }, [reviews, selected]);
   useEffect(() => { const existing = selected ? responses.find((response) => response.review_id === selected.id) : undefined; setReply(existing?.response_text ?? ""); }, [responses, selected]);
   if (!selected) return <StatePanel state="Empty"/>;
-  const sendResponse = async () => { if (!reply.trim()) return; setSaving(true); setMessage(""); try { await saveResponse(selected.id, reply.trim()); setMessage("Response saved and review marked replied."); } catch (error) { console.error(error); setMessage("Could not save this response. Try again."); } finally { setSaving(false); } };
-  return <div className="grid min-h-[calc(100vh-150px)] overflow-hidden rounded-lg border bg-card shadow-card xl:grid-cols-[minmax(360px,.9fr)_minmax(480px,1.3fr)]"><section className="border-r"><div className="border-b p-3"><div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2"><div className="relative"><Search className="absolute left-3 top-2.5 size-4 text-muted-foreground"/><Input className="pl-9" placeholder="Search reviews"/></div><Button variant="outline" size="icon" aria-label="Filter reviews"><Filter/></Button></div><div className="mt-3 flex gap-2 overflow-x-auto"><StatusPill tone="brand">All {reviews.length}</StatusPill><StatusPill>Needs reply {reviews.filter((review) => review.status === "Needs reply").length}</StatusPill><StatusPill>Escalated {reviews.filter((review) => review.status === "Escalated").length}</StatusPill></div></div><div className="divide-y">{reviews.map((review) => <button key={review.id} onClick={() => setSelected(review)} className={cn("w-full p-4 text-left transition-colors", selected.id === review.id ? "bg-brand-soft/60" : "hover:bg-surface")}><div className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-3"><span className="grid size-9 place-items-center rounded-full bg-avatar text-xs font-bold text-avatar-foreground">{review.initials}</span><span className="min-w-0"><strong className="block truncate text-sm">{review.name}</strong><span className="mt-1 flex items-center gap-2"><Stars value={review.rating} small/><span className="text-[10px] text-muted-foreground">{review.source}</span></span></span><span className="text-[10px] text-muted-foreground">{review.time}</span></div><p className="mt-3 line-clamp-2 text-xs leading-5 text-muted-foreground">{review.text}</p></button>)}</div></section>
+  const sendResponse = async () => { if (!reply.trim()) return; setSaving(true); setMessage(""); try { await saveResponse(selected.id, reply.trim()); setMessage("Draft saved to Response Center."); } catch (error) { console.error(error); setMessage("Could not save this response. Try again."); } finally { setSaving(false); } };
+  return <><div className="grid min-h-[calc(100vh-150px)] overflow-hidden rounded-lg border bg-card shadow-card xl:grid-cols-[minmax(360px,.9fr)_minmax(480px,1.3fr)]"><section className="border-r"><div className="border-b p-3"><div className="flex gap-2"><div className="relative min-w-0 flex-1"><Search className="absolute left-3 top-2.5 size-4 text-muted-foreground"/><Input className="pl-9" placeholder="Search reviews"/></div><Button onClick={() => setFormOpen(true)} size="icon" aria-label="Add review"><Plus/></Button><Button variant="outline" size="icon" aria-label="Filter reviews"><Filter/></Button></div><div className="mt-3 flex gap-2 overflow-x-auto"><StatusPill tone="brand">All {reviews.length}</StatusPill><StatusPill>Needs reply {reviews.filter((review) => review.status === "Needs reply").length}</StatusPill><StatusPill>Escalated {reviews.filter((review) => review.status === "Escalated").length}</StatusPill></div></div><div className="divide-y">{reviews.map((review) => <button key={review.id} onClick={() => setSelected(review)} className={cn("w-full p-4 text-left transition-colors", selected?.id === review.id ? "bg-brand-soft/60" : "hover:bg-surface")}><div className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-3"><span className="grid size-9 place-items-center rounded-full bg-avatar text-xs font-bold text-avatar-foreground">{review.initials}</span><span className="min-w-0"><strong className="block truncate text-sm">{review.name}</strong><span className="mt-1 flex items-center gap-2"><Stars value={review.rating} small/><span className="text-[10px] text-muted-foreground">{review.source}</span></span></span><span className="text-[10px] text-muted-foreground">{review.time}</span></div><p className="mt-3 line-clamp-2 text-xs leading-5 text-muted-foreground">{review.text}</p></button>)}</div></section>
     <section className="min-w-0"><div className="flex items-center justify-between border-b px-5 py-3"><div className="flex items-center gap-2"><StatusPill tone={selected.rating <= 2 ? "bad" : selected.rating === 3 ? "warn" : "good"}>{selected.sentiment}</StatusPill><StatusPill>{selected.status}</StatusPill></div><div className="flex"><IconButton label="Assign review"><Users/></IconButton><IconButton label="More actions"><MoreHorizontal/></IconButton></div></div><div className="p-5 lg:p-7"><div className="flex items-start gap-3"><span className="grid size-11 shrink-0 place-items-center rounded-full bg-avatar font-display text-sm font-bold text-avatar-foreground">{selected.initials}</span><div className="min-w-0"><h2 className="font-display text-lg font-bold">{selected.name}</h2><p className="mt-1 text-xs text-muted-foreground">{selected.location} · {selected.source} · {selected.time}</p><div className="mt-3"><Stars value={selected.rating}/></div></div></div><blockquote className="mt-6 border-l-2 border-brand pl-4 text-[15px] leading-7 text-foreground">“{selected.text}”</blockquote><div className="mt-6 rounded-lg border bg-surface p-4"><div className="flex items-center justify-between"><span className="flex items-center gap-2 text-xs font-bold"><WandSparkles className="size-4 text-brand"/>Suggested response</span><button className="text-xs font-semibold text-brand">Regenerate</button></div><textarea value={reply} onChange={(e) => { setReply(e.target.value); setMessage(""); }} placeholder={`Hi ${selected.name.split(" ")[0]}, thank you for taking the time to share this with us…`} className="mt-3 min-h-32 w-full resize-none rounded-md border bg-background p-3 text-sm leading-6 outline-none transition-shadow focus:ring-2 focus:ring-ring"/><div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><span className="min-w-0 text-[11px] text-muted-foreground">{message || "Warm · Concise · Brand-safe"}</span><Button onClick={() => void sendResponse()} disabled={saving || !reply.trim()}><Send/>{saving ? "Saving…" : "Send response"}</Button></div></div><div className="mt-5 border-t pt-5"><h3 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Collaboration</h3><div className="mt-3 flex items-center gap-3 text-xs"><span className="grid size-7 place-items-center rounded-full bg-avatar font-bold">RS</span><span><strong>Riya</strong> assigned this to Customer Care</span><span className="ml-auto text-muted-foreground">12 min ago</span></div></div></div></section></div>;
 }
 
