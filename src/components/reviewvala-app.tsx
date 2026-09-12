@@ -135,13 +135,10 @@ function useWorkspaceData() {
   const saveResponse = useCallback(async (reviewId: string, responseText: string) => {
     const existing = responses.find((response) => response.review_id === reviewId);
     const responseResult = existing
-      ? await supabase.from("reviewvala_responses").update({ response_text: responseText, response_status: "Approved" }).eq("id", existing.id).select("id, review_id, response_text, response_status, author_name").single()
-      : await supabase.from("reviewvala_responses").insert({ review_id: reviewId, response_text: responseText, response_status: "Approved" }).select("id, review_id, response_text, response_status, author_name").single();
+      ? await supabase.from("reviewvala_responses").update({ response_text: responseText, response_status: "Draft" }).eq("id", existing.id).select("id, review_id, response_text, response_status, author_name").single()
+      : await supabase.from("reviewvala_responses").insert({ review_id: reviewId, response_text: responseText, response_status: "Draft" }).select("id, review_id, response_text, response_status, author_name").single();
     if (responseResult.error) throw responseResult.error;
-    const reviewResult = await supabase.from("reviewvala_reviews").update({ status: "Replied" }).eq("id", reviewId).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
-    if (reviewResult.error) throw reviewResult.error;
     setResponses((current) => [responseResult.data, ...current.filter((response) => response.id !== responseResult.data.id)]);
-    setWorkspaceReviews((current) => current.map((review) => review.id === reviewId ? mapReview(reviewResult.data) : review));
   }, [responses]);
 
   const approveResponse = useCallback(async (responseId: string) => {
@@ -150,7 +147,40 @@ function useWorkspaceData() {
     setResponses((current) => current.map((response) => response.id === responseId ? result.data : response));
   }, []);
 
-  return { reviews: workspaceReviews, responses, snapshots, dataStatus, saveResponse, approveResponse };
+  const publishResponse = useCallback(async (responseId: string) => {
+    const response = responses.find((item) => item.id === responseId);
+    if (!response || response.response_status !== "Approved") throw new Error("Only approved responses can be published.");
+    const responseResult = await supabase.from("reviewvala_responses").update({ response_status: "Published" }).eq("id", responseId).select("id, review_id, response_text, response_status, author_name").single();
+    if (responseResult.error) throw responseResult.error;
+    const reviewResult = await supabase.from("reviewvala_reviews").update({ status: "Replied" }).eq("id", response.review_id).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
+    if (reviewResult.error) throw reviewResult.error;
+    setResponses((current) => current.map((item) => item.id === responseId ? responseResult.data : item));
+    setWorkspaceReviews((current) => current.map((review) => review.id === response.review_id ? mapReview(reviewResult.data) : review));
+  }, [responses]);
+
+  const createReview = useCallback(async (input: { name: string; source: string; location: string; rating: number; text: string }) => {
+    const nameParts = input.name.trim().split(/\s+/).filter(Boolean);
+    const initials = nameParts.slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("") || "RV";
+    const sentiment = input.rating >= 4 ? "Positive" : input.rating === 3 ? "Mixed" : "Negative";
+    const result = await supabase.from("reviewvala_reviews").insert({
+      workspace_slug: "northstar-group",
+      reviewer_initials: initials,
+      reviewer_name: input.name.trim(),
+      source: input.source,
+      location: input.location.trim(),
+      rating: input.rating,
+      time_label: "Just now",
+      status: "Needs reply",
+      sentiment,
+      review_text: input.text.trim(),
+    }).select("id, reviewer_initials, reviewer_name, source, location, rating, time_label, status, sentiment, review_text").single();
+    if (result.error) throw result.error;
+    const review = mapReview(result.data);
+    setWorkspaceReviews((current) => [review, ...current]);
+    return review;
+  }, []);
+
+  return { reviews: workspaceReviews, responses, snapshots, dataStatus, saveResponse, approveResponse, publishResponse, createReview };
 }
 
 const pageDescriptions: Record<PageKey, string> = {
